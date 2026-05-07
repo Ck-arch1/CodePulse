@@ -87,7 +87,19 @@ class _FunctionCollector(ast.NodeVisitor):
 def parse_python_file(path: str | Path) -> ParsedPythonFile:
     source_path = Path(path)
     source = source_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(source_path))
+    try:
+        tree = ast.parse(source, filename=str(source_path))
+
+    except SyntaxError:
+        return ParsedPythonFile(
+        path=str(source_path),
+        source=source,
+        tree_sitter_root_type="syntax_error",
+        functions=[],
+        ast_tree=ast.Module(body=[], type_ignores=[]),
+        lines_of_code=len(source.splitlines())
+    )
+
     collector = _FunctionCollector()
     collector.visit(tree)
     return ParsedPythonFile(
