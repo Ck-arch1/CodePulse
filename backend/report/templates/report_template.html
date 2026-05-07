@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>CodePulse Report - {{ report.file_name }}</title>
+    <style>
+      body { font-family: Inter, Segoe UI, Arial, sans-serif; margin: 32px; color: #111827; }
+      h1, h2 { margin-bottom: 8px; }
+      table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+      th, td { border: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; }
+      th { background: #f9fafb; }
+      .badge { font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <h1>CodePulse Report</h1>
+    <p>{{ report.file_name }} · {{ report.lines_of_code }} LOC · {{ report.scan_time_ms }} ms</p>
+    <h2>Summary</h2>
+    <p>Total findings: {{ report.stats.total_findings }} · Taint paths: {{ report.stats.taint_path_count }}</p>
+    <h2>Findings</h2>
+    <table>
+      <tr><th>Severity</th><th>Type</th><th>Function</th><th>Line</th><th>Message</th></tr>
+      {% for finding in report.findings %}
+      <tr><td class="badge">{{ finding.severity }}</td><td>{{ finding.type }}</td><td>{{ finding.function_name }}</td><td>{{ finding.line_number }}</td><td>{{ finding.message }}</td></tr>
+      {% endfor %}
+    </table>
+  </body>
+</html>
