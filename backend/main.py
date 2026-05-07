@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -47,6 +48,20 @@ async def _save_upload(upload: UploadFile) -> Path:
 @app.get("/health")
 async def health():
     return {"status": "ok", "ollama": await ollama_health()}
+
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.endswith(".py"):
+        raise HTTPException(status_code=400, detail="Only Python .py files are supported.")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    content.decode("utf-8", errors="replace")
+    mock_path = Path(__file__).with_name("mock_response.json")
+    return json.loads(mock_path.read_text(encoding="utf-8"))
 
 
 @app.post("/analyze")

@@ -1,0 +1,36 @@
+{
+  "graph": {
+    "nodes": [
+      {
+        "data": {
+          "id": "login",
+          "label": "login",
+          "risk": 8
+        }
+      },
+      {
+        "data": {
+          "id": "query_db",
+          "label": "query_db",
+          "risk": 4
+        }
+      }
+    ],
+    "edges": [
+      {
+        "data": {
+          "source": "login",
+          "target": "query_db"
+        }
+      }
+    ]
+  },
+  "findings": [
+    {
+      "title": "Bare except detected",
+      "severity": "medium",
+      "line": 42
+    }
+  ],
+  "risk_score": 73
+}
