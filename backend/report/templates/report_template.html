@@ -2,10 +2,13 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>CodePulse Report - {{ report.file_name }}</title>
+    <title>CodePulse Security Intelligence Report - {{ report.file_name }}</title>
     <style>
       body { font-family: Inter, Segoe UI, Arial, sans-serif; margin: 32px; color: #111827; }
       h1, h2 { margin-bottom: 8px; }
+      .summary { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 12px; margin: 18px 0; }
+      .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; background: #f9fafb; }
+      .card strong { display: block; font-size: 24px; }
       table { border-collapse: collapse; width: 100%; margin-top: 16px; }
       th, td { border: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; }
       th { background: #f9fafb; }
@@ -13,16 +16,72 @@
     </style>
   </head>
   <body>
-    <h1>CodePulse Report</h1>
-    <p>{{ report.file_name }} · {{ report.lines_of_code }} LOC · {{ report.scan_time_ms }} ms</p>
-    <h2>Summary</h2>
-    <p>Total findings: {{ report.stats.total_findings }} · Taint paths: {{ report.stats.taint_path_count }}</p>
+    <h1>Security Intelligence Report</h1>
+    <p>{{ report.file_name }} · {{ report.language | default("Python") }} · {{ report.lines_of_code }} LOC · {{ report.analysis_mode | default("deep-ast") }}</p>
+    <h2>Executive Summary</h2>
+    <div class="summary">
+      <div class="card"><strong>{{ report.risk_score | default(0) }}</strong><span>Risk score</span></div>
+      <div class="card"><strong>{{ report.findings | length }}</strong><span>Findings</span></div>
+      <div class="card"><strong>{{ report.taint_flows | default([]) | length }}</strong><span>Taint flows</span></div>
+      <div class="card"><strong>{{ report.blast_radius | default(0) }}</strong><span>Blast radius</span></div>
+    </div>
+    <h2>Risk Composition</h2>
+    {% if report.risk_composition %}
+      <ul>
+      {% for key, value in report.risk_composition.items() %}
+        <li>{{ key }}: {{ value }}</li>
+      {% endfor %}
+      </ul>
+    {% else %}
+      <p>Total findings: {{ report.stats.total_findings }} · Taint paths: {{ report.stats.taint_path_count }}</p>
+    {% endif %}
+    <h2>Confidence Analysis</h2>
+    <p>Confidence is deterministic and weighted by evidence depth: taint-confirmed flows are highest, exact Python AST matches are high, Semgrep/Bandit findings are strong external scanner evidence, runtime inference is moderate, and lightweight heuristics are intentionally conservative.</p>
     <h2>Findings</h2>
     <table>
-      <tr><th>Severity</th><th>Type</th><th>Function</th><th>Line</th><th>Message</th></tr>
+      <tr><th>Severity</th><th>Category</th><th>Confidence</th><th>Function</th><th>Line</th><th>Message</th><th>Evidence</th><th>Recommendation</th></tr>
       {% for finding in report.findings %}
-      <tr><td class="badge">{{ finding.severity }}</td><td>{{ finding.type }}</td><td>{{ finding.function_name }}</td><td>{{ finding.line_number }}</td><td>{{ finding.message }}</td></tr>
+      <tr>
+        <td class="badge">{{ finding.severity }}</td>
+        <td>{{ finding.category | default(finding.type) }}</td>
+        <td>{{ finding.confidence | default("n/a") }}</td>
+        <td>{{ finding.function | default(finding.function_name) }}</td>
+        <td>{{ finding.line | default(finding.line_number) }}</td>
+        <td>{{ finding.message }}</td>
+        <td>{{ finding.evidence.analysis_type | default(finding.tool) }} · {{ finding.evidence.matched_pattern | default("") }} · tainted={{ finding.evidence.tainted | default(false) }} · reachable={{ finding.evidence.reachable | default(true) }}</td>
+        <td>{{ finding.recommendation | default("") }}</td>
+      </tr>
       {% endfor %}
     </table>
+    <h2>Vulnerability Categories</h2>
+    <ul>
+      {% set categories = {} %}
+      {% for finding in report.findings %}
+        <li>{{ finding.category | default("informational") }} · {{ finding.message }} · confidence {{ finding.confidence | default("n/a") }}</li>
+      {% endfor %}
+    </ul>
+    <h2>Taint Flow Narratives</h2>
+    {% if report.taint_flows %}
+      <ul>
+      {% for flow in report.taint_flows %}
+        <li>{{ flow.source }} reaches {{ flow.sink }} on line {{ flow.line }}{% if flow.cause_chain %}: {{ flow.cause_chain | join(" -> ") }}{% endif %}</li>
+      {% endfor %}
+      </ul>
+    {% else %}
+      <p>No taint-confirmed flow was identified.</p>
+    {% endif %}
+    <h2>Blast Radius Explanation</h2>
+    <p>Blast radius estimates how many downstream call-graph connections may be affected by risky functions. Isolated unsafe patterns are downgraded unless taint, exposure, or high-confidence evidence increases contextual risk.</p>
+    <h2>Limitations</h2>
+    <p>This report uses lightweight heuristics for unsupported languages, Python AST traversal for Python, and non-symbolic runtime inference. Findings may include false positives, and unsupported languages do not receive deep parser-level analysis.</p>
+    <h2>Complexity</h2>
+    <ul>
+      <li>Universal heuristics: approximately O(N)</li>
+      <li>AST traversal: approximately O(N)</li>
+      <li>Graph generation: approximately O(N + E)</li>
+      <li>Taint propagation worst case: approximately O(N^2)</li>
+      <li>Space complexity: approximately O(N + E)</li>
+    </ul>
+    <p>N = AST nodes or tokens. E = graph edges.</p>
   </body>
 </html>

@@ -7,6 +7,13 @@ export async function analyzeFile(file) {
   return data;
 }
 
+export async function uploadFile(file) {
+  const form = new FormData();
+  form.append('file', file);
+  const { data } = await apiClient.post('/upload', form, { headers: { 'Content-Type': 'multipart/form-data' } });
+  return data;
+}
+
 export async function getFindings() {
   const { data } = await apiClient.get('/findings');
   return data;

@@ -1,10 +1,9 @@
-export default function StatsBar({ report }) {
+export default function StatsBar({ fileMeta }) {
   return (
     <section className="stats-bar">
-      <span>{report.file_name}</span>
-      <span>{report.language}</span>
-      <span>{report.lines_of_code} LOC</span>
-      <span>{report.scan_time_ms} ms</span>
+      <span>{fileMeta.name}</span>
+      <span>{fileMeta.language}</span>
+      <span>{fileMeta.lines} lines</span>
     </section>
   );
 }
