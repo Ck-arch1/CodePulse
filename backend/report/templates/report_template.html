@@ -2,7 +2,7 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>CodePulse Security Intelligence Report - {{ report.file_name }}</title>
+    <title>CodePulse Security Intelligence Assessment - {{ report.file_name }}</title>
     <style>
       body { font-family: Inter, Segoe UI, Arial, sans-serif; margin: 32px; color: #111827; }
       h1, h2 { margin-bottom: 8px; }
@@ -16,7 +16,7 @@
     </style>
   </head>
   <body>
-    <h1>Security Intelligence Report</h1>
+    <h1>Security Intelligence Assessment</h1>
     <p>{{ report.file_name }} · {{ report.language | default("Python") }} · {{ report.lines_of_code }} LOC · {{ report.analysis_mode | default("deep-ast") }}</p>
     <h2>Executive Summary</h2>
     <div class="summary">
@@ -26,6 +26,37 @@
       <div class="card"><strong>{{ report.blast_radius | default(0) }}</strong><span>Blast radius</span></div>
     </div>
     <h2>Risk Composition</h2>
+    {% if report.repo_summary %}
+      <h2>Repository Intelligence</h2>
+      <div class="summary">
+        <div class="card"><strong>{{ report.repo_summary.analyzed_files | default(0) }}</strong><span>Analyzed files</span></div>
+        <div class="card"><strong>{{ report.repo_summary.language_distribution | length }}</strong><span>Languages</span></div>
+        <div class="card"><strong>{{ report.repo_summary.top_risky_dependencies | length }}</strong><span>Dependencies</span></div>
+        <div class="card"><strong>{{ report.graph.edges | default([]) | length }}</strong><span>Graph edges</span></div>
+      </div>
+      <h2>Language Coverage</h2>
+      <ul>
+      {% for key, value in report.repo_summary.language_distribution.items() %}
+        <li>{{ key }}: {{ value }}</li>
+      {% endfor %}
+      </ul>
+      {% if report.repo_summary.critical_files %}
+        <h2>Critical Files</h2>
+        <ul>
+        {% for item in report.repo_summary.critical_files %}
+          <li>{{ item.file }}: risk {{ item.risk_score }}</li>
+        {% endfor %}
+        </ul>
+      {% endif %}
+      {% if report.repo_summary.top_risky_dependencies %}
+        <h2>Dependency Summary</h2>
+        <ul>
+        {% for item in report.repo_summary.top_risky_dependencies %}
+          <li>{{ item.dependency }}: {{ item.count }} reference(s)</li>
+        {% endfor %}
+        </ul>
+      {% endif %}
+    {% endif %}
     {% if report.risk_composition %}
       <ul>
       {% for key, value in report.risk_composition.items() %}
@@ -34,6 +65,34 @@
       </ul>
     {% else %}
       <p>Total findings: {{ report.stats.total_findings }} · Taint paths: {{ report.stats.taint_path_count }}</p>
+    {% endif %}
+    {% if report.warnings %}
+      <h2>Analysis Warnings</h2>
+      <ul>
+      {% for warning in report.warnings %}
+        <li>{{ warning.reason }}{% if warning.limit %} Limit: {{ warning.limit }}.{% endif %}</li>
+      {% endfor %}
+      </ul>
+    {% endif %}
+    <h2>Finding Category Counts</h2>
+    {% if report.category_counts %}
+      <ul>
+      {% for key, value in report.category_counts.items() %}
+        <li>{{ key }}: {{ value }}</li>
+      {% endfor %}
+      </ul>
+    {% else %}
+      <p>No categorized findings were produced.</p>
+    {% endif %}
+    <h2>Confidence Distribution</h2>
+    {% if report.confidence_distribution %}
+      <ul>
+      {% for key, value in report.confidence_distribution.items() %}
+        <li>{{ key }} confidence: {{ value }}</li>
+      {% endfor %}
+      </ul>
+    {% else %}
+      <p>No confidence data was available.</p>
     {% endif %}
     <h2>Confidence Analysis</h2>
     <p>Confidence is deterministic and weighted by evidence depth: taint-confirmed flows are highest, exact Python AST matches are high, Semgrep/Bandit findings are strong external scanner evidence, runtime inference is moderate, and lightweight heuristics are intentionally conservative.</p>
@@ -73,7 +132,17 @@
     <h2>Blast Radius Explanation</h2>
     <p>Blast radius estimates how many downstream call-graph connections may be affected by risky functions. Isolated unsafe patterns are downgraded unless taint, exposure, or high-confidence evidence increases contextual risk.</p>
     <h2>Limitations</h2>
-    <p>This report uses lightweight heuristics for unsupported languages, Python AST traversal for Python, and non-symbolic runtime inference. Findings may include false positives, and unsupported languages do not receive deep parser-level analysis.</p>
+    <p>This report explicitly separates AST-confirmed findings, heuristic findings, inferred runtime risks, and unsupported-language approximations. It uses lightweight heuristics for unsupported languages, Python AST traversal for Python, and non-symbolic runtime inference. Findings may include false positives, and unsupported languages do not receive deep parser-level analysis.</p>
+    <h2>Security Assumptions</h2>
+    <p>CodePulse is intended for local trusted environments, hackathon demos, and single-team analysis workflows. It is not hardened as an internet-facing multi-tenant SaaS, and should not be deployed directly to untrusted public networks without additional infrastructure controls.</p>
+    {% if report.remediation_summary %}
+      <h2>Remediation Summary</h2>
+      <ul>
+      {% for item in report.remediation_summary %}
+        <li>{{ item }}</li>
+      {% endfor %}
+      </ul>
+    {% endif %}
     <h2>Complexity</h2>
     <ul>
       <li>Universal heuristics: approximately O(N)</li>

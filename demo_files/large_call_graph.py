@@ -1,0 +1,38 @@
+def sink(value):
+    return eval(value)
+
+
+def entry(value):
+    return f0(value)
+
+
+def f0(value): return f1(value)
+def f1(value): return f2(value)
+def f2(value): return f3(value)
+def f3(value): return f4(value)
+def f4(value): return f5(value)
+def f5(value): return f6(value)
+def f6(value): return f7(value)
+def f7(value): return f8(value)
+def f8(value): return f9(value)
+def f9(value): return f10(value)
+def f10(value): return f11(value)
+def f11(value): return f12(value)
+def f12(value): return f13(value)
+def f13(value): return f14(value)
+def f14(value): return f15(value)
+def f15(value): return f16(value)
+def f16(value): return f17(value)
+def f17(value): return f18(value)
+def f18(value): return f19(value)
+def f19(value): return f20(value)
+def f20(value): return f21(value)
+def f21(value): return f22(value)
+def f22(value): return f23(value)
+def f23(value): return f24(value)
+def f24(value): return f25(value)
+def f25(value): return f26(value)
+def f26(value): return f27(value)
+def f27(value): return f28(value)
+def f28(value): return f29(value)
+def f29(value): return sink(value)

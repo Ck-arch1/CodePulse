@@ -10,3 +10,4 @@ sqlglot
 jinja2
 httpx
 python-dotenv
+slowapi

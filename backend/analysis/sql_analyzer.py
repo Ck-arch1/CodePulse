@@ -23,7 +23,7 @@ def _sqlglot_can_parse(value: str) -> bool:
 
 def detect_sql_issues(parsed: ParsedPythonFile) -> list[dict]:
     findings: list[dict] = []
-    for node in ast.walk(parsed.ast_tree):
+    for node in parsed.ast_index.nodes:
         risky = False
         line = getattr(node, "lineno", 1)
         expression = ast.unparse(node)

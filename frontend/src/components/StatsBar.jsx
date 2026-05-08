@@ -1,9 +1,11 @@
 export default function StatsBar({ fileMeta }) {
+  if (!fileMeta) return null;
   return (
     <section className="stats-bar">
-      <span>{fileMeta.name}</span>
-      <span>{fileMeta.language}</span>
-      <span>{fileMeta.lines} lines</span>
+      <span>{fileMeta.name || 'source file'}</span>
+      <span>{fileMeta.language || 'Source'}</span>
+      <span>{fileMeta.lines || 0} lines</span>
+      {fileMeta.previewed && <span>editor preview truncated</span>}
     </section>
   );
 }

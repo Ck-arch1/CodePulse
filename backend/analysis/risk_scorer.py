@@ -1,20 +1,36 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from networkx import DiGraph, single_source_shortest_path_length
+from collections import deque
+from networkx import DiGraph
+
+from config import get_settings
 
 WEIGHTS = {"LOW": 1.5, "MEDIUM": 3.0, "HIGH": 5.0, "CRITICAL": 7.0}
 
 
 def score_functions(graph: DiGraph, findings: list[dict], taint: dict, blast_radii: dict) -> dict[str, float]:
+    settings = get_settings()
     by_function = defaultdict(list)
     for finding in findings:
-        by_function[finding["function_name"]].append(finding)
+        function_name = finding.get("function") or finding.get("function_name")
+        if function_name:
+            by_function[function_name].append(finding)
     roots = [node for node, degree in graph.in_degree() if degree == 0] or list(graph.nodes)
     depth = {}
     for root in roots:
-        for node, dist in single_source_shortest_path_length(graph, root).items():
+        seen = {root}
+        queue = deque([(root, 0)])
+        while queue:
+            node, dist = queue.popleft()
             depth[node] = min(depth.get(node, dist), dist)
+            if dist >= settings.max_recursion_depth:
+                continue
+            for child in graph.successors(node):
+                if child in seen:
+                    continue
+                seen.add(child)
+                queue.append((child, dist + 1))
     tainted = set(taint.get("tainted_functions", []))
     scores = {}
     for node in graph.nodes:

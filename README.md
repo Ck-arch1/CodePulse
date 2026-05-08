@@ -256,12 +256,20 @@ http://localhost:5173
 
 ## Limitations
 
+- CodePulse is designed for local trusted environments, hackathon/demo workflows, and single-team analysis usage.
+- CodePulse is not an internet-facing multi-tenant SaaS and should not be exposed publicly without additional infrastructure controls.
 - Deep AST analysis currently supports Python only.
 - Non-Python languages use heuristic scanning, not compiler-grade parsing.
 - Taint analysis is intentionally lightweight and does not perform symbolic execution.
 - Bracket balancing may flag brackets inside strings or comments.
 - SQL detection is heuristic and does not understand every database API.
 - Runtime risk detection is heuristic and should be treated as a signal, not proof.
+
+## Local Security Model
+
+Uploads are isolated by `scan_id` and retained only in bounded in-memory storage. Scans expire after `SCAN_TTL_SECONDS`, and the oldest scans are evicted after `MAX_SCAN_RETENTION`. File size, AST node count, graph size, finding count, taint path count, and prompt size are all bounded with graceful warnings.
+
+This keeps the MVP demo-safe and prevents accidental cross-scan leakage, but it is still intended for trusted local use rather than production multi-tenant hosting.
 
 ## Roadmap
 

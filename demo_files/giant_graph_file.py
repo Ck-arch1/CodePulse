@@ -1,0 +1,52 @@
+def source():
+    return input("value> ")
+
+
+def sink(value):
+    return eval(value)
+
+
+def node_000(value): return sink(value)
+def node_001(value): return node_000(value)
+def node_002(value): return node_001(value)
+def node_003(value): return node_002(value)
+def node_004(value): return node_003(value)
+def node_005(value): return node_004(value)
+def node_006(value): return node_005(value)
+def node_007(value): return node_006(value)
+def node_008(value): return node_007(value)
+def node_009(value): return node_008(value)
+def node_010(value): return node_009(value)
+def node_011(value): return node_010(value)
+def node_012(value): return node_011(value)
+def node_013(value): return node_012(value)
+def node_014(value): return node_013(value)
+def node_015(value): return node_014(value)
+def node_016(value): return node_015(value)
+def node_017(value): return node_016(value)
+def node_018(value): return node_017(value)
+def node_019(value): return node_018(value)
+def node_020(value): return node_019(value)
+def node_021(value): return node_020(value)
+def node_022(value): return node_021(value)
+def node_023(value): return node_022(value)
+def node_024(value): return node_023(value)
+def node_025(value): return node_024(value)
+def node_026(value): return node_025(value)
+def node_027(value): return node_026(value)
+def node_028(value): return node_027(value)
+def node_029(value): return node_028(value)
+def node_030(value): return node_029(value)
+def node_031(value): return node_030(value)
+def node_032(value): return node_031(value)
+def node_033(value): return node_032(value)
+def node_034(value): return node_033(value)
+def node_035(value): return node_034(value)
+def node_036(value): return node_035(value)
+def node_037(value): return node_036(value)
+def node_038(value): return node_037(value)
+def node_039(value): return node_038(value)
+
+
+def entry():
+    return node_039(source())

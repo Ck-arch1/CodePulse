@@ -4,7 +4,18 @@ import { useEffect, useMemo, useRef } from 'react';
 export default function CodePanel({ code, findings }) {
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
-  const markers = useMemo(() => findings.map(f => ({ startLineNumber: f.line, endLineNumber: f.line, startColumn: 1, endColumn: 120, message: f.message || f.title, severity: 4 })), [findings]);
+  const safeFindings = Array.isArray(findings) ? findings : [];
+  const markers = useMemo(() => safeFindings.slice(0, 500).map(f => {
+    const line = Number(f?.line || f?.line_number || 1);
+    return {
+      startLineNumber: Math.max(1, line),
+      endLineNumber: Math.max(1, line),
+      startColumn: 1,
+      endColumn: 120,
+      message: f?.message || f?.title || 'CodePulse finding',
+      severity: 4
+    };
+  }), [safeFindings]);
 
   useEffect(() => {
     const model = editorRef.current?.getModel();

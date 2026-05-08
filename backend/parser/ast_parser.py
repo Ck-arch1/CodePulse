@@ -3,7 +3,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+
+from parser.ast_index import AstIndex, build_ast_index, call_name
 
 try:
     from tree_sitter import Language, Parser
@@ -30,6 +31,7 @@ class ParsedPythonFile:
     tree_sitter_root_type: str
     functions: list[FunctionNode]
     ast_tree: ast.AST
+    ast_index: AstIndex
     lines_of_code: int
 
 
@@ -45,61 +47,33 @@ def _tree_sitter_root_type(source: str) -> str:
         return "module"
 
 
-def call_name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        base = call_name(node.value)
-        return f"{base}.{node.attr}" if base else node.attr
-    if isinstance(node, ast.Call):
-        return call_name(node.func)
-    return None
-
-
-class _FunctionCollector(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.stack: list[str] = []
-        self.functions: list[FunctionNode] = []
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
-        self._collect(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
-        self._collect(node)
-
-    def _collect(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        qualname = ".".join([*self.stack, node.name]) if self.stack else node.name
-        calls = sorted({name for child in ast.walk(node) if isinstance(child, ast.Call) for name in [call_name(child.func)] if name})
-        self.functions.append(FunctionNode(
-            name=node.name,
-            qualname=qualname,
-            line_number=node.lineno,
-            end_line_number=int(getattr(node, "end_lineno", node.lineno)),
-            args=[arg.arg for arg in node.args.args],
-            calls=calls,
-            decorators=[call_name(item) or ast.unparse(item) for item in node.decorator_list],
-        ))
-        self.stack.append(node.name)
-        self.generic_visit(node)
-        self.stack.pop()
-
-
 def parse_python_file(path: str | Path) -> ParsedPythonFile:
     source_path = Path(path)
     source = source_path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(source_path))
-    collector = _FunctionCollector()
-    collector.visit(tree)
+    ast_index = build_ast_index(tree)
+    functions = [
+        FunctionNode(
+            name=fn.name,
+            qualname=fn.qualname,
+            line_number=fn.line_number,
+            end_line_number=fn.end_line_number,
+            args=fn.args,
+            calls=fn.calls,
+            decorators=fn.decorators,
+        )
+        for fn in ast_index.functions
+    ]
     return ParsedPythonFile(
         path=str(source_path),
         source=source,
         tree_sitter_root_type=_tree_sitter_root_type(source),
-        functions=collector.functions,
+        functions=functions,
         ast_tree=tree,
+        ast_index=ast_index,
         lines_of_code=sum(1 for line in source.splitlines() if line.strip()),
     )
 
 
 def function_for_line(parsed: ParsedPythonFile, line_number: int) -> str:
-    candidates = [fn for fn in parsed.functions if fn.line_number <= line_number <= fn.end_line_number]
-    return max(candidates, key=lambda fn: fn.line_number).qualname if candidates else "<module>"
+    return parsed.ast_index.function_for_line(line_number)

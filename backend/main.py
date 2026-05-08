@@ -1,19 +1,40 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import io
+import logging
+import math
+import mimetypes
 import re
+import sys
 import time
 from pathlib import Path
 from uuid import uuid4
+import zipfile
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
+
+try:
+    from slowapi import Limiter
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+    from slowapi.middleware import SlowAPIMiddleware
+except ImportError:  # Slowapi is lightweight but optional for older local venvs.
+    Limiter = None
+    RateLimitExceeded = None
+    SlowAPIMiddleware = None
+
+    def get_remote_address(request: Request) -> str:
+        return request.client.host if request.client else "local"
 
 from analysis.blast_radius import compute_blast_radius
 from analysis.confidence_engine import score_confidence, should_keep_finding
 from analysis.contextual_severity import contextualize_severity
+from analysis.graph_cache import GraphQueryCache
 from analysis.risk_scorer import score_functions
 from analysis.security_scanner import run_security_scanners
 from analysis.sql_analyzer import detect_sql_issues
@@ -21,19 +42,132 @@ from analysis.taint_analyzer import trace_taint
 from config import get_settings
 from llm.explainer import stream_explanation
 from llm.ollama_client import ollama_health
+from parser.ast_index import build_ast_index
 from parser.ast_parser import parse_python_file
 from parser.graph_builder import build_call_graph, graph_to_json
 from report.report_builder import build_report_json, render_html_report
+from repository.repo_analyzer import analyze_repository, cleanup_repo, safe_extract_zip, write_uploaded_files
 from utils.language_detector import detect_language
+
+logger = logging.getLogger("codepulse")
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="CodePulse", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
+if Limiter:
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_middleware(SlowAPIMiddleware)
 
-LAST_SCAN = {"report": None, "file_content": "", "graph": {"nodes": [], "edges": []}, "findings": []}
+    @app.exception_handler(RateLimitExceeded)
+    async def rate_limit_handler(request: Request, exc: Exception):
+        return JSONResponse(status_code=429, content={"error": "Too many requests. Please wait briefly and retry."})
+else:
+    limiter = None
+
+SCAN_STORE: dict[str, dict] = {}
 
 
 class ExplainRequest(BaseModel):
     finding_id: str
+
+
+def rate_limit(rule: str):
+    def decorator(func):
+        return limiter.limit(rule)(func) if limiter else func
+    return decorator
+
+
+def _cleanup_scans() -> None:
+    settings = get_settings()
+    now = time.time()
+    expired = [
+        scan_id
+        for scan_id, scan in SCAN_STORE.items()
+        if now - float(scan.get("created_at", now)) > settings.scan_ttl_seconds
+    ]
+    for scan_id in expired:
+        cleanup_repo(scan_id)
+        SCAN_STORE.pop(scan_id, None)
+    if len(SCAN_STORE) > settings.max_scan_retention:
+        ordered = sorted(SCAN_STORE.items(), key=lambda item: item[1].get("created_at", 0))
+        for scan_id, _ in ordered[: len(SCAN_STORE) - settings.max_scan_retention]:
+            cleanup_repo(scan_id)
+            SCAN_STORE.pop(scan_id, None)
+
+
+def _store_scan(report: dict, file_content: str, scan_id: str | None = None) -> str:
+    _cleanup_scans()
+    scan_id = scan_id or uuid4().hex
+    report["scan_id"] = scan_id
+    SCAN_STORE[scan_id] = {
+        "created_at": time.time(),
+        "report": report,
+        "file_content": file_content,
+        "graph": report.get("graph", {"nodes": [], "edges": []}),
+        "findings": report.get("findings", []),
+    }
+    _cleanup_scans()
+    return scan_id
+
+
+def _get_scan(scan_id: str) -> dict:
+    _cleanup_scans()
+    scan = SCAN_STORE.get(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail={"error": "Scan not found or expired", "scan_id": scan_id})
+    return scan
+
+
+def _safe_error(message: str, status_code: int = 400) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"error": message})
+
+
+def _looks_binary(content: bytes) -> bool:
+    if not content:
+        return False
+    sample = content[:4096]
+    if b"\x00" in sample:
+        return True
+    control = sum(1 for byte in sample if byte < 9 or (13 < byte < 32))
+    return control / max(1, len(sample)) > 0.08
+
+
+def _validate_upload(file: UploadFile, content: bytes) -> str:
+    settings = get_settings()
+    if not file.filename:
+        raise _safe_error("A source file name is required.")
+    if len(content) > settings.max_file_size_bytes:
+        raise _safe_error(f"File exceeds {settings.max_file_size_mb}MB limit.", 413)
+    if _looks_binary(content):
+        raise _safe_error("Binary uploads are not supported. Please upload a text source file.", 415)
+    guessed, _ = mimetypes.guess_type(file.filename)
+    content_type = (file.content_type or guessed or "text/plain").lower()
+    allowed = (
+        content_type.startswith("text/")
+        or content_type in {"application/octet-stream", "application/x-python-code", "application/javascript", "application/json"}
+        or file.filename.lower().endswith((".py", ".cpp", ".cc", ".cxx", ".c", ".java", ".js", ".ts", ".cs", ".go", ".rs"))
+    )
+    if not allowed:
+        raise _safe_error("Unsupported upload type. Please upload a text source file.", 415)
+    return content.decode("utf-8", errors="replace")
+
+
+def _is_zip_upload(file: UploadFile, content: bytes) -> bool:
+    name = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+    return name.endswith(".zip") or content_type in {"application/zip", "application/x-zip-compressed"} or zipfile.is_zipfile(io.BytesIO(content))
+
+
+def _repo_file_content(report: dict) -> str:
+    files = report.get("file_reports") or []
+    lines = [
+        f"Repository scan: {report.get('file_name', 'repository')}",
+        f"Analyzed files: {len(files)}",
+        "",
+    ]
+    lines.extend(f"{item.get('file_name')} - {item.get('language')} - risk {item.get('risk_score', 0)}" for item in files)
+    return "\n".join(lines)
 
 
 def _call_name(node: ast.AST) -> str | None:
@@ -279,7 +413,7 @@ def _compose_risk(findings: list[dict], blast_radius: int) -> tuple[int, dict]:
     composition["blast_radius"] = min(blast_radius * 5, 20)
 
     severity_factor = {"low": 0.35, "medium": 0.65, "high": 1.0, "critical": 1.25}
-    dominant = 0.0
+    dominant_score = 0.0
     for finding in findings:
         category = finding.get("category", "informational")
         severity = finding.get("severity", "low")
@@ -288,15 +422,97 @@ def _compose_risk(findings: list[dict], blast_radius: int) -> tuple[int, dict]:
         composition[category] = composition.get(category, 0.0) + contribution
         if finding.get("evidence", {}).get("tainted"):
             composition["propagation"] += 35 * confidence
-            dominant = max(dominant, 72 * confidence)
+            if severity == "critical" and not finding.get("evidence", {}).get("inferred"):
+                dominant_score = max(dominant_score, 75 + (20 * confidence))
+            else:
+                dominant_score = max(dominant_score, 55 + (20 * confidence))
 
     caps = {"syntax": 15, "runtime": 20, "security": 60, "reliability": 20, "logical": 15, "informational": 5, "propagation": 35, "blast_radius": 20}
     rounded = {key: round(min(value, caps.get(key, value)), 2) for key, value in composition.items() if value > 0}
-    composed = int(round(sum(rounded.values())))
-    return min(100, max(composed, int(round(dominant)))), rounded
+    raw = sum(rounded.values())
+    nonlinear = 100 * (1 - math.exp(-raw / 75))
+    return min(99, int(round(max(nonlinear, dominant_score)))), rounded
+
+
+def _severity_rank(severity: str) -> int:
+    return {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(str(severity).lower(), 0)
+
+
+def _rank_findings(findings: list[dict]) -> list[dict]:
+    return sorted(
+        findings,
+        key=lambda item: (
+            -_severity_rank(item.get("severity", item.get("type", "low"))),
+            -float(item.get("confidence", 0.0)),
+            item.get("category", ""),
+            int(item.get("line", item.get("line_number", 0)) or 0),
+            item.get("message", ""),
+        ),
+    )
+
+
+def _limit_findings(findings: list[dict], max_findings: int, warnings: list[dict]) -> list[dict]:
+    ranked = _rank_findings(findings)
+    if len(ranked) <= max_findings:
+        limited = ranked
+    else:
+        limited = ranked[:max_findings]
+        warnings.append({
+            "truncated": True,
+            "reason": "Finding limit exceeded; lowest-confidence findings were suppressed first.",
+            "limit": max_findings,
+            "original_count": len(findings),
+        })
+    for index, finding in enumerate(limited, start=1):
+        finding["id"] = f"finding-{index}"
+    return limited
+
+
+def _limit_graph(graph: dict, max_nodes: int, max_edges: int, warnings: list[dict]) -> dict:
+    nodes = list(graph.get("nodes") or [])
+    edges = list(graph.get("edges") or [])
+    if len(nodes) > max_nodes:
+        nodes = sorted(
+            nodes,
+            key=lambda node: (
+                -int(node.get("data", {}).get("risk", 0) or 0),
+                node.get("data", {}).get("node_type") == "normal",
+                -int(node.get("data", {}).get("blast_radius", 0) or 0),
+                node.get("data", {}).get("id", ""),
+            ),
+        )[:max_nodes]
+        kept = {node.get("data", {}).get("id") for node in nodes}
+        edges = [edge for edge in edges if edge.get("data", {}).get("source") in kept and edge.get("data", {}).get("target") in kept]
+        warnings.append({"truncated": True, "reason": "Graph node limit exceeded; low-risk nodes were collapsed.", "limit": max_nodes, "original_count": len(graph.get("nodes") or [])})
+    if len(edges) > max_edges:
+        edges = sorted(edges, key=lambda edge: (not bool(edge.get("data", {}).get("risky")), edge.get("data", {}).get("source", ""), edge.get("data", {}).get("target", "")))[:max_edges]
+        warnings.append({"truncated": True, "reason": "Graph edge limit exceeded; non-risky edges were collapsed first.", "limit": max_edges, "original_count": len(graph.get("edges") or [])})
+    return {"nodes": nodes, "edges": edges}
+
+
+def _category_counts(findings: list[dict]) -> dict:
+    counts: dict[str, int] = {}
+    for finding in findings:
+        category = finding.get("category", "informational")
+        counts[category] = counts.get(category, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _confidence_distribution(findings: list[dict]) -> dict:
+    distribution = {"high": 0, "medium": 0, "low": 0}
+    for finding in findings:
+        confidence = float(finding.get("confidence", 0.0))
+        if confidence >= 0.9:
+            distribution["high"] += 1
+        elif confidence >= 0.6:
+            distribution["medium"] += 1
+        else:
+            distribution["low"] += 1
+    return distribution
 
 
 def analyze_upload_source(source: str, filename: str) -> dict:
+    settings = get_settings()
     language_info = detect_language(filename)
     language = language_info["language"]
     supported_ast = language_info["supported_ast"]
@@ -308,6 +524,28 @@ def analyze_upload_source(source: str, filename: str) -> dict:
     function_risk: dict[str, int] = {}
     taint_flows: list[dict] = []
     graph = {"nodes": [], "edges": []}
+    warnings: list[dict] = []
+    limits = {
+        "max_file_size_bytes": settings.max_file_size_bytes,
+        "max_ast_nodes": settings.max_ast_nodes,
+        "max_findings": settings.max_findings,
+        "max_graph_nodes": settings.max_graph_nodes,
+        "max_graph_edges": settings.max_graph_edges,
+        "max_taint_paths": settings.max_taint_paths,
+        "max_recursion_depth": settings.max_recursion_depth,
+    }
+    if len(source.splitlines()) > settings.max_render_lines:
+        warnings.append({
+            "truncated": False,
+            "reason": "Large source file; frontend editor rendering may use safeguards.",
+            "limit": settings.max_render_lines,
+            "original_count": len(source.splitlines()),
+        })
+    if not supported_ast:
+        warnings.append({
+            "truncated": False,
+            "reason": "Unsupported language uses heuristic-only analysis; deep AST confirmation is not available.",
+        })
 
     def add_finding(
         category: str,
@@ -350,6 +588,22 @@ def analyze_upload_source(source: str, filename: str) -> dict:
         total_risk += risk
         function_risk[function] = max(function_risk.get(function, 0), risk)
 
+    def finalize_result(result: dict) -> dict:
+        result["findings"] = _limit_findings(result.get("findings") or [], settings.max_findings, warnings)
+        result["graph"] = _limit_graph(result.get("graph") or {"nodes": [], "edges": []}, settings.max_graph_nodes, settings.max_graph_edges, warnings)
+        risk_score, risk_composition = _compose_risk(result["findings"], int(result.get("blast_radius", 0) or 0))
+        result["risk_score"] = risk_score
+        result["risk_composition"] = risk_composition
+        result["warnings"] = warnings
+        result["limits"] = limits
+        result["truncated"] = any(item.get("truncated") for item in warnings)
+        result["graph_truncated"] = any("Graph" in str(item.get("reason", "")) and item.get("truncated") for item in warnings)
+        result["category_counts"] = _category_counts(result["findings"])
+        result["confidence_distribution"] = _confidence_distribution(result["findings"])
+        result["remediation_summary"] = sorted({finding.get("recommendation", "") for finding in result["findings"] if finding.get("recommendation")})
+        result["explanations"] = [finding.get("explanation", "") for finding in result["findings"]]
+        return result
+
     def universal_heuristic_analysis() -> None:
         bracket_pairs = {"(": ")", "[": "]", "{": "}"}
         openers = set(bracket_pairs)
@@ -363,6 +617,7 @@ def analyze_upload_source(source: str, filename: str) -> dict:
 
         for index, line in enumerate(lines, start=1):
             stripped = line.strip()
+            comment_only = stripped.startswith(("#", "//", "/*", "*"))
             for char in line:
                 if char in openers:
                     stack.append((char, index))
@@ -380,19 +635,19 @@ def analyze_upload_source(source: str, filename: str) -> dict:
                 add_finding(category, severity, "TODO/FIXME marker found", index, 8 if sensitive_context else 2, tool="keyword-heuristic", recommendation="Track or resolve this note before release.")
             if len(line) > 140:
                 add_finding("reliability", "low", "Extremely long line may hide complex logic", index, 5, tool="line-heuristic", recommendation="Split long logic into clearer statements.")
-            if secret_pattern.search(line):
+            if not comment_only and secret_pattern.search(line):
                 add_finding("security", "medium", "Hardcoded secret detected", index, 25, tool="secret-heuristic", recommendation="Move credentials to environment variables or a secret store.", evidence={"analysis_type": "heuristic", "matched_pattern": "secret assignment", "tainted": False, "reachable": True})
-            if shell_pattern.search(line):
+            if not comment_only and shell_pattern.search(line):
                 add_finding("security", "medium", "Suspicious shell command execution pattern detected", index, 25, tool="command-heuristic", recommendation="Avoid shelling out with user-controlled data.", evidence={"analysis_type": "heuristic", "matched_pattern": "shell command keyword", "tainted": False, "reachable": True})
-            if eval_pattern.search(line):
+            if not comment_only and eval_pattern.search(line):
                 add_finding("security", "medium", "Suspicious eval-like execution detected", index, 25, tool="eval-heuristic", recommendation="Avoid dynamic code execution.", evidence={"analysis_type": "heuristic", "matched_pattern": "eval-like keyword", "tainted": False, "reachable": True})
-            if sql_concat_pattern.search(line):
+            if not comment_only and sql_concat_pattern.search(line):
                 add_finding("security", "medium", "Possible SQL string concatenation detected", index, 25, tool="sql-heuristic", recommendation="Use parameterized queries.")
-            if re.search(r"/\s*0\b", line):
+            if not comment_only and re.search(r"/\s*0\b", line):
                 add_finding("runtime", "medium", "Possible divide-by-zero operation", index, 10, tool="runtime-heuristic", recommendation="Check denominator values before division.")
-            if re.search(r"\[[^\]]+\]", line) and not any(term in stripped for term in ("if ", "try", "catch", "except")):
+            if not comment_only and re.search(r"\[[^\]]+\]", line) and not any(term in stripped for term in ("if ", "try", "catch", "except")):
                 add_finding("runtime", "low", "Potential unchecked indexing operation", index, 5, tool="runtime-heuristic", recommendation="Validate collection bounds before indexing.")
-            if stripped.endswith((".", "+", "-", "*", "/", "=", ",")):
+            if not comment_only and stripped.endswith((".", "+", "-", "*", "/", "=", ",")):
                 add_finding("syntax", "low", "Line appears to end with an unfinished statement", index, 5, tool="syntax-heuristic", recommendation="Check whether this statement is incomplete.")
 
         for opener, line_number in stack[:3]:
@@ -406,20 +661,19 @@ def analyze_upload_source(source: str, filename: str) -> dict:
             finding["type"] = finding["severity"]
             finding["explanation"] = _upgrade_explanation(finding, 0)
         stable = _dedupe_findings(findings)
-        risk_score, risk_composition = _compose_risk(stable, 0)
-        graph["nodes"] = [{"data": {"id": "module", "label": language, "risk": _risk_bucket(risk_score), "node_type": "normal", "reachable": True, "blast_radius": 0}}]
-        return {
+        graph["nodes"] = [{"data": {"id": "module", "label": language, "risk": 1, "node_type": "normal", "reachable": True, "blast_radius": 0}}]
+        return finalize_result({
             "language": language,
             "supported_ast": False,
             "analysis_mode": analysis_mode,
-            "risk_score": risk_score,
-            "risk_composition": risk_composition,
+            "risk_score": 0,
+            "risk_composition": {},
             "findings": stable,
             "graph": graph,
-            "taint_flows": taint_flows,
+            "taint_flows": taint_flows[: settings.max_taint_paths],
             "blast_radius": 0,
             "explanations": [finding["explanation"] for finding in stable],
-        }
+        })
 
     try:
         tree = ast.parse(source)
@@ -430,30 +684,81 @@ def analyze_upload_source(source: str, filename: str) -> dict:
             finding["type"] = finding["severity"]
             finding["explanation"] = _upgrade_explanation(finding, 0)
         stable = _dedupe_findings(findings)
-        risk_score, risk_composition = _compose_risk(stable, 0)
-        graph["nodes"] = [{"data": {"id": "module", "label": "python", "risk": _risk_bucket(risk_score), "node_type": "normal", "reachable": True, "blast_radius": 0}}]
-        return {
+        graph["nodes"] = [{"data": {"id": "module", "label": "python", "risk": 1, "node_type": "normal", "reachable": True, "blast_radius": 0}}]
+        return finalize_result({
             "language": language,
             "supported_ast": True,
             "analysis_mode": "heuristic",
-            "risk_score": risk_score,
-            "risk_composition": risk_composition,
+            "risk_score": 0,
+            "risk_composition": {},
             "findings": stable,
             "graph": graph,
-            "taint_flows": taint_flows,
+            "taint_flows": taint_flows[: settings.max_taint_paths],
             "blast_radius": 0,
             "explanations": [finding["explanation"] for finding in stable],
-        }
+        })
+    except (RecursionError, MemoryError):
+        warnings.append({"truncated": True, "reason": "Parser resource limit reached; deep AST analysis was skipped."})
+        for finding in findings:
+            finding["severity"] = contextualize_severity(finding["severity"], {"confidence": finding.get("confidence", 0.0), "tainted": False, "blast_radius": 0})
+            finding["type"] = finding["severity"]
+            finding["explanation"] = _upgrade_explanation(finding, 0)
+        stable = _dedupe_findings(findings)
+        graph["nodes"] = [{"data": {"id": "module", "label": "python", "risk": 1, "node_type": "normal", "reachable": True, "blast_radius": 0}}]
+        return finalize_result({
+            "language": language,
+            "supported_ast": True,
+            "analysis_mode": "heuristic-limited",
+            "risk_score": 0,
+            "risk_composition": {},
+            "findings": stable,
+            "graph": graph,
+            "taint_flows": taint_flows[: settings.max_taint_paths],
+            "blast_radius": 0,
+            "explanations": [finding["explanation"] for finding in stable],
+        })
+
+    ast_index = build_ast_index(tree)
+    all_nodes = ast_index.nodes
+    if len(all_nodes) > settings.max_ast_nodes:
+        warnings.append({
+            "truncated": True,
+            "reason": "AST node limit exceeded; deep Python analysis was skipped after universal heuristics.",
+            "limit": settings.max_ast_nodes,
+            "original_count": len(all_nodes),
+        })
+        for finding in findings:
+            finding["severity"] = contextualize_severity(finding["severity"], {"confidence": finding.get("confidence", 0.0), "tainted": False, "blast_radius": 0})
+            finding["type"] = finding["severity"]
+            finding["explanation"] = _upgrade_explanation(finding, 0)
+        stable = _dedupe_findings(findings)
+        graph["nodes"] = [{"data": {"id": "module", "label": "python", "risk": 1, "node_type": "normal", "reachable": True, "blast_radius": 0}}]
+        return finalize_result({
+            "language": language,
+            "supported_ast": True,
+            "analysis_mode": "heuristic-limited",
+            "risk_score": 0,
+            "risk_composition": {},
+            "findings": stable,
+            "graph": graph,
+            "taint_flows": taint_flows[: settings.max_taint_paths],
+            "blast_radius": 0,
+            "explanations": [finding["explanation"] for finding in stable],
+        })
+
+    original_recursion_limit = sys.getrecursionlimit()
+    if settings.max_recursion_depth > original_recursion_limit:
+        sys.setrecursionlimit(settings.max_recursion_depth)
 
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
     function_ranges: dict[str, tuple[int, int]] = {}
     tainted_vars: dict[str, str] = {}
     tainted_var_chains: dict[str, list[str]] = {}
 
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            functions[node.name] = node
-            function_ranges[node.name] = (node.lineno, int(getattr(node, "end_lineno", node.lineno)))
+    for fn in ast_index.functions:
+        if fn.node is not None:
+            functions[fn.name] = fn.node
+            function_ranges[fn.name] = (fn.line_number, fn.end_line_number)
 
     tainted_returns: dict[str, str] = {}
     tainted_return_chains: dict[str, list[str]] = {}
@@ -497,14 +802,15 @@ def analyze_upload_source(source: str, filename: str) -> dict:
         changed = False
         for name, fn_node in functions.items():
             local_tainted: dict[str, list[str]] = {}
-            for child in ast.walk(fn_node):
-                if isinstance(child, (ast.Assign, ast.AnnAssign)) and child.value is not None:
-                    source_chain = local_expr_chain(child.value, local_tainted)
+            for assignment in ast_index.assignments_by_function.get(name, []):
+                if assignment.value is not None:
+                    source_chain = local_expr_chain(assignment.value, local_tainted)
                     if source_chain:
-                        for assigned in _assigned_names(child):
+                        for assigned in assignment.names:
                             local_tainted[assigned] = _dedupe_chain([*source_chain, assigned])
-                elif isinstance(child, ast.Return) and child.value is not None:
-                    source_chain = local_expr_chain(child.value, local_tainted)
+            for return_info in ast_index.returns_by_function.get(name, []):
+                if return_info.value is not None:
+                    source_chain = local_expr_chain(return_info.value, local_tainted)
                     source_name = chain_source(source_chain)
                     if source_name and tainted_returns.get(name) != source_name:
                         tainted_returns[name] = source_name
@@ -537,12 +843,12 @@ def analyze_upload_source(source: str, filename: str) -> dict:
             tainted_vars.setdefault(arg.arg, "function argument")
 
     for name, fn in functions.items():
-        calls_self = any(isinstance(node, ast.Call) and _call_name(node.func) == name for node in ast.walk(fn))
-        has_base_case = any(isinstance(node, ast.If) for node in ast.walk(fn))
+        calls_self = any(call.name == name for call in ast_index.calls_by_function.get(name, []))
+        has_base_case = any(hint.kind == "if" for hint in ast_index.control_flow_hints if hint.function_name == name)
         if calls_self and not has_base_case:
             add_python_finding("Possible infinite recursion without an obvious base case", fn.lineno, 15, "runtime", "medium", "recursion-heuristic", "Add a clear base case before recursive calls.", evidence={"analysis_type": "heuristic", "matched_pattern": "self-recursive call without if", "tainted": False, "reachable": True})
 
-    for node in ast.walk(tree):
+    for node in ast_index.nodes:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             value = node.value
             if value is not None:
@@ -612,15 +918,14 @@ def analyze_upload_source(source: str, filename: str) -> dict:
     edges = []
     seen_edges: set[tuple[str, str]] = set()
     outgoing_counts: dict[str, int] = {}
-    for source_name, fn_node in functions.items():
-        for node in ast.walk(fn_node):
-            if isinstance(node, ast.Call):
-                target = (_call_name(node.func) or "").split(".")[-1]
-                edge = (source_name, target)
-                if target in known_functions and edge not in seen_edges:
-                    seen_edges.add(edge)
-                    edges.append({"data": {"source": source_name, "target": target}})
-                    outgoing_counts[source_name] = outgoing_counts.get(source_name, 0) + 1
+    for source_name in functions:
+        for call in ast_index.calls_by_function.get(source_name, []):
+            target = call.name.split(".")[-1]
+            edge = (source_name, target)
+            if target in known_functions and edge not in seen_edges:
+                seen_edges.add(edge)
+                edges.append({"data": {"source": source_name, "target": target}})
+                outgoing_counts[source_name] = outgoing_counts.get(source_name, 0) + 1
 
     vulnerable_functions = {finding["function"] for finding in findings if finding["function"] != "module"}
     blast_radius = sum(outgoing_counts.get(name, 0) for name in vulnerable_functions)
@@ -656,12 +961,11 @@ def analyze_upload_source(source: str, filename: str) -> dict:
     }
     source_functions = {
         function_for(getattr(node, "lineno", 1))
-        for node in ast.walk(tree)
+        for node in ast_index.nodes
         if _source_name(node)
     }
 
     stable_findings = _dedupe_findings(findings)
-    risk_score, risk_composition = _compose_risk(stable_findings, blast_radius)
 
     risky_edge_pairs = set()
     for finding in stable_findings:
@@ -691,32 +995,31 @@ def analyze_upload_source(source: str, filename: str) -> dict:
             }
         }
         for name in functions
-    ] or [{"data": {"id": "module", "label": "python", "risk": _risk_bucket(risk_score), "node_type": "normal", "reachable": True, "blast_radius": 0}}]
+    ] or [{"data": {"id": "module", "label": "python", "risk": 1, "node_type": "normal", "reachable": True, "blast_radius": 0}}]
 
-    return {
+    return finalize_result({
         "language": language,
         "supported_ast": True,
         "analysis_mode": analysis_mode,
-        "risk_score": risk_score,
-        "risk_composition": risk_composition,
+        "risk_score": 0,
+        "risk_composition": {},
         "findings": stable_findings,
         "graph": graph,
-        "taint_flows": taint_flows,
+        "taint_flows": taint_flows[: settings.max_taint_paths],
         "blast_radius": blast_radius,
         "explanations": [finding["explanation"] for finding in stable_findings],
-    }
+    })
 
 
 async def _save_upload(upload: UploadFile) -> Path:
     settings = get_settings()
     if not upload.filename or not upload.filename.endswith(".py"):
-        raise HTTPException(status_code=400, detail="Only .py files are supported.")
+        raise _safe_error("Only .py files are supported on /analyze. Use /upload for heuristic multilingual analysis.")
     content = await upload.read()
-    if len(content) > settings.max_file_size_bytes:
-        raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_file_size_mb}MB limit.")
+    source = _validate_upload(upload, content)
     path = settings.upload_dir / f"{uuid4().hex}-{Path(upload.filename).name}"
     path.write_bytes(content)
-    LAST_SCAN["file_content"] = content.decode("utf-8", errors="replace")
+    path.with_suffix(path.suffix + ".decoded.txt").write_text(source, encoding="utf-8")
     return path
 
 
@@ -726,76 +1029,203 @@ async def health():
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="A source file name is required.")
-
+@rate_limit("20/minute")
+async def upload(request: Request, file: UploadFile = File(...)):
     content = await file.read()
     if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        raise _safe_error("Uploaded file is empty.")
 
-    source = content.decode("utf-8", errors="replace")
-    result = analyze_upload_source(source, file.filename)
-    LAST_SCAN.update({
-        "report": {
-            **result,
-            "file_name": file.filename,
-            "lines_of_code": len(source.splitlines()),
-            "scan_time_ms": 0,
-        },
-        "file_content": source,
-        "graph": result["graph"],
-        "findings": result["findings"],
-    })
-    return result
+    if _is_zip_upload(file, content):
+        scan_id = uuid4().hex
+        try:
+            repo_root, warnings = await asyncio.to_thread(safe_extract_zip, content, scan_id)
+            report = await asyncio.to_thread(analyze_repository, repo_root, analyze_upload_source, warnings)
+            report["file_name"] = file.filename or "repository.zip"
+            report["scan_time_ms"] = int(report.get("scan_time_ms", 0) or 0)
+            _store_scan(report, _repo_file_content(report), scan_id=scan_id)
+            cleanup_repo(scan_id)
+            return report
+        except zipfile.BadZipFile:
+            cleanup_repo(scan_id)
+            raise _safe_error("Invalid ZIP archive.", 400)
+        except HTTPException:
+            cleanup_repo(scan_id)
+            raise
+        except Exception:
+            cleanup_repo(scan_id)
+            logger.exception("Repository ZIP analysis failed safely")
+            raise _safe_error("Repository analysis failed safely. Try a smaller ZIP.", 500)
 
-
-@app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-    started = time.perf_counter()
-    path = await _save_upload(file)
-    parsed = parse_python_file(path)
-    graph = build_call_graph(parsed)
-    findings = await run_security_scanners(path, parsed)
-    findings.extend(detect_sql_issues(parsed))
-    taint = trace_taint(parsed, graph, findings)
-    blast = compute_blast_radius(graph, findings)
-    scores = score_functions(graph, findings, taint, blast)
-    elapsed = int((time.perf_counter() - started) * 1000)
-    report = build_report_json(file.filename or path.name, parsed, graph, findings, scores, taint, blast, elapsed)
-    LAST_SCAN.update({"report": report, "graph": graph_to_json(graph), "findings": findings})
+    source = _validate_upload(file, content)
+    result = await asyncio.to_thread(analyze_upload_source, source, file.filename)
+    report = {
+        **result,
+        "file_name": file.filename,
+        "lines_of_code": len(source.splitlines()),
+        "scan_time_ms": 0,
+    }
+    _store_scan(report, source)
     return report
 
 
+@app.post("/upload-repo")
+@rate_limit("8/minute")
+async def upload_repo(request: Request, files: list[UploadFile] = File(...)):
+    if not files:
+        raise _safe_error("At least one source file is required.")
+    settings = get_settings()
+    scan_id = uuid4().hex
+    raw_files: list[tuple[str, bytes]] = []
+    total = 0
+    try:
+        for upload_file in files:
+            content = await upload_file.read()
+            total += len(content)
+            if total > settings.max_repo_extracted_bytes:
+                raise _safe_error("Repository upload exceeds configured size limit.", 413)
+            if _is_zip_upload(upload_file, content):
+                repo_root, warnings = await asyncio.to_thread(safe_extract_zip, content, scan_id)
+                report = await asyncio.to_thread(analyze_repository, repo_root, analyze_upload_source, warnings)
+                report["file_name"] = upload_file.filename or "repository.zip"
+                _store_scan(report, _repo_file_content(report), scan_id=scan_id)
+                cleanup_repo(scan_id)
+                return report
+            raw_files.append((upload_file.filename or "source", content))
+        repo_root, warnings = await asyncio.to_thread(write_uploaded_files, raw_files, scan_id)
+        report = await asyncio.to_thread(analyze_repository, repo_root, analyze_upload_source, warnings)
+        report["file_name"] = "uploaded-files"
+        _store_scan(report, _repo_file_content(report), scan_id=scan_id)
+        cleanup_repo(scan_id)
+        return report
+    except HTTPException:
+        cleanup_repo(scan_id)
+        raise
+    except Exception:
+        cleanup_repo(scan_id)
+        logger.exception("Multi-file repository analysis failed safely")
+        raise _safe_error("Repository analysis failed safely. Try fewer or smaller files.", 500)
+
+
+@app.post("/analyze")
+@rate_limit("10/minute")
+async def analyze(request: Request, file: UploadFile = File(...)):
+    started = time.perf_counter()
+    path: Path | None = None
+    decoded_path: Path | None = None
+    source = ""
+    try:
+        path = await _save_upload(file)
+        decoded_path = path.with_suffix(path.suffix + ".decoded.txt")
+        source = decoded_path.read_text(encoding="utf-8", errors="replace") if decoded_path.exists() else path.read_text(encoding="utf-8", errors="replace")
+        timings: dict[str, int] = {}
+        step_started = time.perf_counter()
+        parsed = await asyncio.to_thread(parse_python_file, path)
+        timings["ast_index_ms"] = int((time.perf_counter() - step_started) * 1000)
+        if parsed.ast_index.node_count > get_settings().max_ast_nodes:
+            raise _safe_error("AST node limit exceeded. Try a smaller source file.", 413)
+
+        step_started = time.perf_counter()
+        graph = await asyncio.to_thread(build_call_graph, parsed)
+        timings["graph_generation_ms"] = int((time.perf_counter() - step_started) * 1000)
+
+        scanner_task = asyncio.create_task(run_security_scanners(path, parsed))
+        sql_task = asyncio.to_thread(detect_sql_issues, parsed)
+        scanner_findings, sql_findings = await asyncio.gather(scanner_task, sql_task)
+        findings = [*scanner_findings, *sql_findings]
+
+        graph_cache = GraphQueryCache(graph, max_depth=get_settings().max_graph_traversal_depth, max_nodes=get_settings().max_graph_nodes)
+        step_started = time.perf_counter()
+        taint = await asyncio.to_thread(trace_taint, parsed, graph, findings, graph_cache)
+        timings["taint_propagation_ms"] = int((time.perf_counter() - step_started) * 1000)
+        if len(taint.get("paths", [])) > get_settings().max_taint_paths:
+            taint["paths"] = taint["paths"][: get_settings().max_taint_paths]
+        blast = await asyncio.to_thread(compute_blast_radius, graph, findings, graph_cache)
+        scores = await asyncio.to_thread(score_functions, graph, findings, taint, blast)
+        elapsed = int((time.perf_counter() - started) * 1000)
+        report = build_report_json(file.filename or path.name, parsed, graph, findings, scores, taint, blast, elapsed)
+        report["performance"] = {**timings, "analysis_time_ms": elapsed}
+        logger.info("scan=%s ast_index_ms=%s graph_generation_ms=%s taint_propagation_ms=%s analysis_time_ms=%s nodes=%s edges=%s findings=%s",
+                    file.filename, timings.get("ast_index_ms"), timings.get("graph_generation_ms"), timings.get("taint_propagation_ms"),
+                    elapsed, graph.number_of_nodes(), graph.number_of_edges(), len(report.get("findings", [])))
+        _store_scan(report, source)
+        parsed = None
+        graph = None
+        return report
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Analyze endpoint failed safely")
+        raise _safe_error("Analysis failed safely. Try a smaller or simpler source file.", 500)
+    finally:
+        for candidate in (path, decoded_path):
+            if candidate:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Temporary file cleanup failed for %s", candidate)
+
+
+@app.get("/findings/{scan_id}")
+async def findings(scan_id: str):
+    return _get_scan(scan_id)["findings"]
+
+
 @app.get("/findings")
-async def findings():
-    return LAST_SCAN["findings"]
+async def findings_missing_scan():
+    raise _safe_error("Missing scan_id. Use /findings/{scan_id}.", 400)
 
 
-@app.post("/explain")
-async def explain(payload: ExplainRequest):
-    report = LAST_SCAN.get("report")
-    if not report:
-        raise HTTPException(status_code=404, detail="No scan is available.")
-    finding = next((item for item in report["findings"] if item["id"] == payload.finding_id), None)
+@app.post("/explain/{scan_id}")
+@rate_limit("30/minute")
+async def explain(request: Request, scan_id: str, payload: ExplainRequest):
+    scan = _get_scan(scan_id)
+    report = scan["report"]
+    finding = next((item for item in report.get("findings", []) if item.get("id") == payload.finding_id), None)
     if not finding:
-        raise HTTPException(status_code=404, detail="Finding not found.")
-    context = {"risk_score": report["scores"].get(finding["function_name"]), "blast_radius": report["blast_radii"].get(finding["function_name"]), "taint_paths": report["taint_paths"]}
+        raise _safe_error("Finding not found for this scan.", 404)
+    legacy_function_name = finding.get("function") or finding.get("function_name") or "module"
+    legacy_blast = (report.get("blast_radii") or {}).get(legacy_function_name, {})
+    blast_radius = report.get("blast_radius", legacy_blast.get("count", 0) if isinstance(legacy_blast, dict) else 0)
+    taint_paths = report.get("taint_flows") or report.get("taint_paths") or []
+    context = {
+        "risk_score": report.get("risk_score", (report.get("scores") or {}).get(legacy_function_name, 0)),
+        "blast_radius": blast_radius or 0,
+        "taint_paths": taint_paths,
+    }
     return StreamingResponse(stream_explanation(finding, context), media_type="text/event-stream")
 
 
+@app.post("/explain")
+async def explain_missing_scan(payload: ExplainRequest):
+    raise _safe_error("Missing scan_id. Use /explain/{scan_id}.", 400)
+
+
+@app.get("/graph/{scan_id}")
+async def graph(scan_id: str):
+    return _get_scan(scan_id)["graph"]
+
+
 @app.get("/graph")
-async def graph():
-    return LAST_SCAN["graph"]
+async def graph_missing_scan():
+    raise _safe_error("Missing scan_id. Use /graph/{scan_id}.", 400)
 
 
-@app.get("/report", response_class=HTMLResponse)
-async def report():
-    if not LAST_SCAN.get("report"):
-        raise HTTPException(status_code=404, detail="No scan is available.")
-    return render_html_report(LAST_SCAN["report"])
+@app.get("/report/{scan_id}", response_class=HTMLResponse)
+async def report(scan_id: str):
+    scan = _get_scan(scan_id)
+    return render_html_report(scan["report"])
 
 
-@app.get("/file-content", response_class=PlainTextResponse)
-async def file_content():
-    return LAST_SCAN["file_content"]
+@app.get("/report")
+async def report_missing_scan():
+    raise _safe_error("Missing scan_id. Use /report/{scan_id}.", 400)
+
+
+@app.get("/file-content/{scan_id}", response_class=PlainTextResponse)
+async def file_content(scan_id: str):
+    return _get_scan(scan_id)["file_content"]
+
+
+@app.get("/file-content")
+async def file_content_missing_scan():
+    raise _safe_error("Missing scan_id. Use /file-content/{scan_id}.", 400)

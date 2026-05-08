@@ -38,9 +38,12 @@ rules:
 async def _run_json(args: list[str]) -> dict:
     try:
         proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await proc.communicate()
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
         return json.loads(stdout.decode("utf-8", "replace")) if stdout else {}
-    except (FileNotFoundError, json.JSONDecodeError):
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
 
 
@@ -73,9 +76,18 @@ class FallbackScanner(ast.NodeVisitor):
 
 
 def fallback_scan(parsed: ParsedPythonFile) -> list[dict]:
-    scanner = FallbackScanner(parsed)
-    scanner.visit(parsed.ast_tree)
-    return scanner.findings
+    findings: list[dict] = []
+    for sink in parsed.ast_index.dangerous_sinks:
+        tail = sink.name.split(".")[-1]
+        if tail in {"eval", "exec"}:
+            findings.append(_finding(parsed, "fallback", "dangerous-call", "HIGH", sink.line_number, f"Use of {tail} can execute arbitrary code.", "fallback"))
+        for kw in sink.node.keywords:
+            if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                findings.append(_finding(parsed, "fallback", "subprocess-shell", "HIGH", sink.line_number, "subprocess with shell=True can enable command injection.", "fallback"))
+    for hint in parsed.ast_index.control_flow_hints:
+        if hint.kind == "except" and isinstance(hint.node, ast.ExceptHandler) and hint.node.type is None:
+            findings.append(_finding(parsed, "fallback", "bare-except", "MEDIUM", hint.line_number, "Bare except hides the concrete failure mode.", "fallback"))
+    return findings
 
 
 async def run_security_scanners(file_path: str | Path, parsed: ParsedPythonFile) -> list[dict]:

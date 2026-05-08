@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import httpx
 
 from config import get_settings
 
+logger = logging.getLogger("codepulse.llm")
 
 async def ollama_health() -> bool:
     settings = get_settings()
@@ -32,5 +34,6 @@ async def stream_completion(prompt: str):
                         yield token
                     if data.get("done"):
                         break
-    except Exception as exc:
-        yield f"Local Ollama explanation unavailable: {exc}"
+    except Exception:
+        logger.warning("Local Ollama explanation failed")
+        yield "LLM explanation temporarily unavailable. The static analysis result remains available."
